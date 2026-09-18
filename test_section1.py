@@ -339,3 +339,248 @@ def test_live_llm_handles_paraphrase(item):
     got_type, got_adj = _pairs(result.entries)[0]
     assert got_type == want_type, note
     assert got_adj == want_adj, note
+
+
+def test_overlapping_solar_reductions_take_the_tightest():
+    result = interpret_notes(["a", "b"], BATTERY, _Stub([
+        {"note_index": 0, "directive_type": "solar_reduction", "hours": [12, 13], "factor": 0.5},
+        {"note_index": 1, "directive_type": "solar_reduction", "hours": [13, 14], "factor": 0.2},
+    ]))
+    eff = result.effective_solar([100.0] * 24)
+    assert eff[11] == pytest.approx(100.0)
+    assert eff[12] == pytest.approx(50.0)
+    assert eff[13] == pytest.approx(20.0)
+    assert eff[14] == pytest.approx(20.0)
+
+
+def test_overlapping_solar_reductions_order_independent():
+    forward = [
+        {"note_index": 0, "directive_type": "solar_reduction", "hours": [13], "factor": 0.5},
+        {"note_index": 1, "directive_type": "solar_reduction", "hours": [13], "factor": 0.2},
+    ]
+    backward = [
+        {"note_index": 0, "directive_type": "solar_reduction", "hours": [13], "factor": 0.2},
+        {"note_index": 1, "directive_type": "solar_reduction", "hours": [13], "factor": 0.5},
+    ]
+    a = interpret_notes(["a", "b"], BATTERY, _Stub(forward)).effective_solar([100.0] * 24)
+    b = interpret_notes(["a", "b"], BATTERY, _Stub(backward)).effective_solar([100.0] * 24)
+    assert a[13] == b[13] == pytest.approx(20.0)
+
+
+def test_overlapping_reserves_take_the_highest():
+    result = interpret_notes(["a", "b"], BATTERY, _Stub([
+        {"note_index": 0, "directive_type": "minimum_battery_reserve", "hours": [18, 19], "minimum_energy_kwh": 60},
+        {"note_index": 1, "directive_type": "minimum_battery_reserve", "hours": [19, 20], "minimum_energy_kwh": 90},
+    ]))
+    floor = result.reserve_floor(BATTERY.minimum_energy_kwh)
+    assert floor[18] == 60
+    assert floor[19] == 90
+    assert floor[20] == 90
+    assert floor[21] == BATTERY.minimum_energy_kwh
+
+
+def test_overlapping_windows_union():
+    result = interpret_notes(["a", "b"], BATTERY, _Stub([
+        {"note_index": 0, "directive_type": "no_charge_window", "hours": [10, 11]},
+        {"note_index": 1, "directive_type": "no_charge_window", "hours": [11, 12]},
+    ]))
+    assert result.no_charge_hours() == {10, 11, 12}
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Solar drops from 1 PM to 3 PM.", [13, 14]),
+    ("Solar drops from 1 pm to 3 pm.", [13, 14]),
+    ("Solar drops from 1 P.M. until 3 P.M.", [13, 14]),
+    ("Work runs from 2 AM until 5 AM.", [2, 3, 4]),
+    ("Outage from 6 PM until 10 PM.", [18, 19, 20, 21]),
+    ("Cloud cover between 11 AM and 2 PM.", [11, 12, 13]),
+    ("Cleaning from noon until 2 PM.", [12, 13]),
+    ("Servicing from 10 PM to midnight.", [22, 23]),
+    ("Maintenance from 11 PM until 2 AM.", [0, 1, 23]),
+    ("Reduced output between 13:00 and 15:00.", [13, 14]),
+    ("Window from 09:00 until 12:00.", [9, 10, 11]),
+    ("Panel wash from one until three.", [13, 14]),
+    ("Testing from 6 PM through 8 PM.", [18, 19]),
+    ("Limit applies 18:00-21:00.", [18, 19, 20]),
+    ("Inspection from noon until 1 PM.", [12]),
+    ("Overnight work from 10 PM until 1 AM.", [0, 22, 23]),
+    ("Grid cap starting at 7 PM until 9 PM.", [19, 20]),
+])
+def test_parse_window(text, expected):
+    from section1 import parse_window
+    assert parse_window(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "The schedule is unchanged today.",
+    "Solar will be low all day.",
+    "Maintenance from 6 PM until 6 PM.",
+])
+def test_parse_window_returns_none_when_no_usable_range(text):
+    from section1 import parse_window
+    assert parse_window(text) is None
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Solar will drop to about 20% from 1 PM to 3 PM.", 0.2),
+    ("Expect an 80% reduction in solar.", 0.2),
+    ("Usable solar should be treated as roughly 25%.", 0.25),
+    ("Only half of the forecast will be available.", 0.5),
+    ("Roughly one-fifth of normal output.", 0.2),
+    ("Output falls to 40 percent.", 0.4),
+    ("A quarter of forecast solar is usable.", 0.25),
+])
+def test_parse_solar_factor(text, expected):
+    from section1 import parse_solar_factor
+    assert parse_solar_factor(text) == pytest.approx(expected)
+
+
+def test_parse_percentage_of_capacity():
+    from section1 import parse_percentage_of_capacity
+    assert parse_percentage_of_capacity("Keep 50% of the battery capacity.", 200) == 100
+    assert parse_percentage_of_capacity("Keep a quarter of the battery capacity.", 200) == 50
+    assert parse_percentage_of_capacity("Keep 90 kWh in reserve.", 200) is None
+
+
+@pytest.mark.parametrize("payload", [
+    {"directive_interpretation": []},
+    [],
+    {"unexpected": "shape"},
+    "not json at all",
+    None,
+])
+def test_unusable_model_payload_falls_back(payload):
+    class _Weird(_Stub):
+        def interpret(self, notes, battery):
+            entries = GeminiInterpreter._entries_of(payload)
+            if not entries:
+                raise LLMUnavailable("no entries")
+            return entries
+
+    notes = ["Do not charge the battery from 2 PM until 4 PM."]
+    result = interpret_notes(notes, BATTERY, _Weird([]))
+    _assert_contract(result, 1)
+    assert result.entries[0].directive_type is DirectiveType.NO_CHARGE_WINDOW
+    assert result.source == "fallback"
+
+
+def test_llm_retries_then_succeeds():
+    calls = {"n": 0}
+
+    class _Flaky(GeminiInterpreter):
+        def __init__(self):
+            super().__init__(LLMConfig(api_key="x", model="stub", timeout_seconds=1, max_attempts=2))
+
+        @property
+        def available(self):
+            return True
+
+        def _get_client(self):
+            return object()
+
+        def _call(self, client, user_prompt):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient provider error")
+            return '{"directive_interpretation": [{"note_index": 0, "applies": true, ' \
+                   '"directive_type": "no_charge_window", "hours": [14, 15], ' \
+                   '"explanation": "ok"}]}'
+
+    result = interpret_notes(["Do not charge from 2 PM until 4 PM."], BATTERY, _Flaky())
+    assert calls["n"] == 2
+    assert result.source == "llm"
+    assert result.entries[0].directive_type is DirectiveType.NO_CHARGE_WINDOW
+
+
+def test_llm_exhausts_retries_then_falls_back():
+    calls = {"n": 0}
+
+    class _Dead(GeminiInterpreter):
+        def __init__(self):
+            super().__init__(LLMConfig(api_key="x", model="stub", timeout_seconds=1, max_attempts=2))
+
+        @property
+        def available(self):
+            return True
+
+        def _get_client(self):
+            return object()
+
+        def _call(self, client, user_prompt):
+            calls["n"] += 1
+            raise RuntimeError("provider down")
+
+    result = interpret_notes(["Do not charge from 2 PM until 4 PM."], BATTERY, _Dead())
+    assert calls["n"] == 2
+    assert result.source == "fallback"
+    _assert_contract(result, 1)
+
+
+def test_all_distractor_notes_produce_no_directives():
+    notes = [
+        "The seminar has been rescheduled.",
+        "Hostel mess timings change next week.",
+        "New bus passes will be issued on Sunday.",
+    ]
+    result = interpret_notes(notes, BATTERY, _Stub([
+        {"note_index": i, "applies": False, "directive_type": "no_op",
+         "structured_adjustment": None, "explanation": "unrelated"}
+        for i in range(3)
+    ]))
+    _assert_contract(result, 3)
+    assert result.directives == []
+    assert result.effective_solar([100.0] * 24) == [100.0] * 24
+    assert result.grid_cap() == [None] * 24
+
+
+@pytest.mark.parametrize("case", CASES, ids=[c["id"] for c in CASES])
+def test_repeated_calls_are_deterministic(case):
+    request = _request(case)
+    first = interpret_notes(request.operator_notes, request.battery, NO_LLM)
+    second = interpret_notes(request.operator_notes, request.battery, NO_LLM)
+    assert [e.model_dump(mode="json") for e in first.entries] == \
+           [e.model_dump(mode="json") for e in second.entries]
+
+
+def test_interpretation_without_llm_is_fast():
+    import time
+    request = _request(CASES[-1])
+    start = time.perf_counter()
+    for _ in range(50):
+        interpret_notes(request.operator_notes, request.battery, NO_LLM)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 2.0, f"50 interpretations took {elapsed:.2f}s"
+
+
+def test_long_and_messy_note_does_not_crash():
+    notes = ["Please note:\n\n" + ("context " * 400) + "\nDo not charge from 2 PM until 4 PM."]
+    result = interpret_notes(notes, BATTERY, _Stub(None, available=False))
+    _assert_contract(result, 1)
+
+
+@pytest.mark.llm
+def test_live_llm_latency_is_within_budget():
+    import time
+    if not GeminiInterpreter().available:
+        pytest.skip("GEMINI_API_KEY not set")
+    request = _request(CASES[-1])
+    timings = []
+    for _ in range(3):
+        start = time.perf_counter()
+        interpret_notes(request.operator_notes, request.battery)
+        timings.append(time.perf_counter() - start)
+    worst = max(timings)
+    print(f"\nlive interpretation timings: {[f'{t:.2f}s' for t in timings]}")
+    assert worst < 15.0, f"slowest call {worst:.2f}s — p95 latency points at risk"
+
+
+@pytest.mark.llm
+def test_live_llm_is_deterministic():
+    if not GeminiInterpreter().available:
+        pytest.skip("GEMINI_API_KEY not set")
+    request = _request(CASES[5])
+    runs = [
+        _pairs(interpret_notes(request.operator_notes, request.battery).entries)
+        for _ in range(3)
+    ]
+    assert runs[0] == runs[1] == runs[2], f"non-deterministic across runs: {runs}"

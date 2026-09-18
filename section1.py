@@ -19,12 +19,12 @@ try:
     )
 except ImportError:
     from schemas import (
-    ACTIVE_DIRECTIVE_TYPES,
-    BatteryProfile,
-    DirectiveInterpretation,
-    DirectiveType,
-    ScenarioRequest,
-)
+        ACTIVE_DIRECTIVE_TYPES,
+        BatteryProfile,
+        DirectiveInterpretation,
+        DirectiveType,
+        ScenarioRequest,
+    )
 
 
 WORD_NUMBERS: dict[str, int] = {
@@ -156,7 +156,7 @@ def _split_endpoints(matched: str, _full: str) -> tuple[str, str] | None:
         r"\s+to\s+",
         r"\s*(?:-|–|—)\s*",
     ]
-    cleaned = re.sub(r"^(?:from|between|starting\s+(?:at\s+)?)\s+", "", matched).strip()
+    cleaned = re.sub(r"^(?:from|between|starting\s+(?:at\s+)?)\s*", "", matched).strip()
     for sep in separators:
         parts = re.split(sep, cleaned, maxsplit=1)
         if len(parts) == 2 and parts[0].strip() and parts[1].strip():
@@ -307,7 +307,7 @@ class InterpretationResult(BaseModel):
         for d in self.directives:
             if d.directive_type is DirectiveType.SOLAR_REDUCTION:
                 for h in d.hours:
-                    eff[h] = raw_solar[h] * float(d.factor or 0.0)
+                    eff[h] = min(eff[h], raw_solar[h] * float(d.factor or 0.0))
         return eff
 
     def no_charge_hours(self) -> set[int]:
