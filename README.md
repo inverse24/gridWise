@@ -16,7 +16,7 @@ directives, validates them deterministically, and returns a cost-minimal
 |---|---|
 | Live endpoint | `https://gridwise-1.onrender.com` |
 | Docker image | `ghcr.io/inverse24/gridwise:latest` |
-| Image digest | `TODO: sha256:...` (from the GitHub Actions run log) |
+| Image digest | `sha256:15147e474a6c753308e8683d28e78b9a3f4491da9defb1ed6ebbbccd19cc4911` |
 | Repository | `https://github.com/inverse24/gridWise` |
 
 > **Please wake the service before testing.** It is hosted on a free tier that
@@ -247,6 +247,17 @@ corpus using wording that does not appear in the public sample pack.
 All 10 public sample cases return the reference `total_cost_bdt` exactly, and
 every returned plan passes an independent replay of the challenge constraints.
 
+`check_live.py` runs the same ten cases against a deployed instance and reports
+per-case latency, whether the LLM path is active on that server, and the status
+code for a malformed request:
+
+```bash
+python check_live.py https://gridwise-1.onrender.com
+```
+
+Against the deployed instance, a warm run answers all ten cases correctly with a
+median of about three seconds per request.
+
 ---
 
 ## Repository layout
@@ -275,8 +286,8 @@ gridWise/
 
 - The service is hosted on a free tier that suspends idle instances. A cold
   start costs up to 50 seconds on the first request; subsequent requests respond
-  in about a second. A scheduled health ping keeps the instance warm during the
-  evaluation window.
+  in roughly three seconds. Call `GET /health` first and wait for it to return
+  before timing anything else.
 - Interpretation quality depends on Gemini availability. With no reachable
   provider the service still responds, but from the conservative fallback
   reading, which is weaker on unusual paraphrases.
