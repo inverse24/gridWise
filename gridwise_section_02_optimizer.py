@@ -312,7 +312,9 @@ def solve_scenario(scenario: Dict[str, Any]) -> Dict[str, Any]:
 
     plan: List[Dict[str, Any]] = []
     state_idx = final_energy
-    for hour in reversed(hours):
+    for hour_data in reversed(hours): 
+        
+        hour = int(hour_data["hour"])
         prev_idx, action, battery_kwh, grid_import, solar_used = back[hour][state_idx]
         plan.append({
             "hour": hour,
