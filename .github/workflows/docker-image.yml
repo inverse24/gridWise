@@ -1,0 +1,47 @@
+name: Build and push Docker image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/gridwise:latest
+            ghcr.io/${{ github.repository_owner }}/gridwise:${{ github.sha }}
+
+      - name: Show the exact digest to submit
+        run: |
+          echo "Image:  ghcr.io/${{ github.repository_owner }}/gridwise:latest"
+          echo "Digest: ${{ steps.build.outputs.digest }}"
+
+      - name: Verify the image starts and /health responds
+        run: |
+          docker run -d --name gridwise -p 8000:8000 \
+            -e GEMINI_API_KEY=not-a-real-key \
+            ghcr.io/${{ github.repository_owner }}/gridwise:latest
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health; then echo " -> health OK"; exit 0; fi
+            sleep 2
+          done
+          echo "health never became ready"; docker logs gridwise; exit 1
