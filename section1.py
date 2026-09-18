@@ -9,23 +9,13 @@ from dataclasses import dataclass
 from pydantic import BaseModel, ConfigDict
 from typing import Any
 
-try:
-    from schemas import (
-        ACTIVE_DIRECTIVE_TYPES,
-        BatteryProfile,
-        DirectiveInterpretation,
-        DirectiveType,
-        ScenarioRequest,
-    )
-except ImportError:
-    from schemas import (
-        ACTIVE_DIRECTIVE_TYPES,
-        BatteryProfile,
-        DirectiveInterpretation,
-        DirectiveType,
-        ScenarioRequest,
-    )
-
+from schemas import (
+    ACTIVE_DIRECTIVE_TYPES,
+    BatteryProfile,
+    DirectiveInterpretation,
+    DirectiveType,
+    ScenarioRequest,
+)
 
 WORD_NUMBERS: dict[str, int] = {
     "one": 1,
