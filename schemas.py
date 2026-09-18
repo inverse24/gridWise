@@ -1,21 +1,9 @@
-"""
-Exact request/response contract from the GridWise Problem Statement.
-
-This module is the single source of truth for JSON shapes. Section 2 (optimizer)
-and Section 3 (validation/response) should import from here rather than
-re-declaring field names.
-"""
-
 from __future__ import annotations
 
 from enum import Enum
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-
-# --------------------------------------------------------------------------- #
-# Enums (Problem Statement section 04 / allowed_enums in the sample pack)
-# --------------------------------------------------------------------------- #
 
 
 class DirectiveType(str, Enum):
@@ -33,7 +21,6 @@ class BatteryAction(str, Enum):
     IDLE = "idle"
 
 
-#: Directive types that actually change the optimization model.
 ACTIVE_DIRECTIVE_TYPES = frozenset(
     {
         DirectiveType.SOLAR_REDUCTION,
@@ -44,7 +31,6 @@ ACTIVE_DIRECTIVE_TYPES = frozenset(
     }
 )
 
-#: Required keys inside structured_adjustment, per directive type.
 REQUIRED_ADJUSTMENT_KEYS: dict[DirectiveType, frozenset[str]] = {
     DirectiveType.SOLAR_REDUCTION: frozenset({"hours", "factor"}),
     DirectiveType.MINIMUM_BATTERY_RESERVE: frozenset({"hours", "minimum_energy_kwh"}),
@@ -53,15 +39,9 @@ REQUIRED_ADJUSTMENT_KEYS: dict[DirectiveType, frozenset[str]] = {
     DirectiveType.MAX_GRID_WINDOW: frozenset({"hours", "max_grid_kwh"}),
 }
 
-#: Judge tolerance (Problem Statement 11.5).
 TOLERANCE = 0.01
 
 HOURS_IN_DAY = 24
-
-
-# --------------------------------------------------------------------------- #
-# Request schema (Problem Statement section 07)
-# --------------------------------------------------------------------------- #
 
 
 class HourEntry(BaseModel):
@@ -94,7 +74,6 @@ class BatteryProfile(BaseModel):
 
 
 class ScenarioRequest(BaseModel):
-    """POST /optimize-energy request body."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -119,26 +98,18 @@ class ScenarioRequest(BaseModel):
             raise ValueError("hours must contain exactly one entry for each hour 0..23")
         return hours
 
-    # -- convenience accessors used by every downstream section ------------- #
 
     def hours_sorted(self) -> list[HourEntry]:
-        """Hour entries in ascending hour order, regardless of input order."""
         return sorted(self.hours, key=lambda h: h.hour)
 
     def demand(self) -> list[float]:
         return [h.demand_kwh for h in self.hours_sorted()]
 
     def solar(self) -> list[float]:
-        """Raw forecast solar, before any solar_reduction directive."""
         return [h.solar_kwh for h in self.hours_sorted()]
 
     def tariff(self) -> list[float]:
         return [h.tariff_bdt_per_kwh for h in self.hours_sorted()]
-
-
-# --------------------------------------------------------------------------- #
-# Response schema (Problem Statement section 10)
-# --------------------------------------------------------------------------- #
 
 
 class SolarReductionAdjustment(BaseModel):
@@ -165,7 +136,6 @@ class MaxGridAdjustment(BaseModel):
 
 
 class DirectiveInterpretation(BaseModel):
-    """One entry per operator note, returned in note_index order."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -205,7 +175,6 @@ class HealthResponse(BaseModel):
 
 
 class ErrorResponse(BaseModel):
-    """Controlled error body. Never contains secrets or stack traces."""
 
     model_config = ConfigDict(extra="forbid")
     error: str
