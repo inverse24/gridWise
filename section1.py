@@ -838,7 +838,7 @@ def _assert_invariants(report: GuardrailReport, note_count: int) -> None:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemini-2.0-flash"
+DEFAULT_MODEL = "gemini-3.6-flash"
 DEFAULT_TIMEOUT_SECONDS = 12.0
 DEFAULT_MAX_ATTEMPTS = 2
 
