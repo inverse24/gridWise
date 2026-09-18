@@ -2,11 +2,44 @@ from __future__ import annotations
 
 import json
 import re
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
 
 STEP = 0.5
 EPS = 1e-9
+
+
+def decimal_places(value: float) -> int:
+    decimal_value = Decimal(str(value))
+    exponent = decimal_value.as_tuple().exponent
+    if exponent >= 0:
+        return 0
+    return abs(exponent)
+
+
+def infer_step(scenario: Dict[str, Any]) -> float:
+    values: List[float] = []
+    battery = scenario["battery"]
+    values.extend([
+        float(battery["initial_energy_kwh"]),
+        float(battery["minimum_energy_kwh"]),
+        float(battery["capacity_kwh"]),
+        float(battery["max_charge_kwh_per_hour"]),
+        float(battery["max_discharge_kwh_per_hour"]),
+    ])
+    for hour in scenario["hours"]:
+        values.extend([
+            float(hour["demand_kwh"]),
+            float(hour["solar_kwh"]),
+        ])
+
+    max_decimals = max((decimal_places(float(v)) for v in values), default=0)
+    if max_decimals == 0:
+        return 1.0
+
+    step = 10 ** (-max_decimals)
+    return min(step, 0.1)
 
 
 def to_hour_index(value: str) -> int:
@@ -28,6 +61,18 @@ def to_hour_index(value: str) -> int:
 
 def normalize_note_text(note: str) -> str:
     return note.lower().replace("–", "-").replace("—", "-")
+
+
+def infer_context_window(text: str, default: List[int] | None = None) -> List[int]:
+    if "afternoon" in text or "midday" in text or "daytime" in text:
+        return list(range(12, 18))
+    if "evening" in text or "peak" in text or "sunset" in text:
+        return list(range(17, 22))
+    if "night" in text or "overnight" in text or "midnight" in text:
+        return list(range(0, 6))
+    if "morning" in text or "early morning" in text:
+        return list(range(6, 12))
+    return default or []
 
 
 def parse_time_window(note: str) -> List[int]:
@@ -82,8 +127,7 @@ def detect_directives_from_notes(scenario: Dict[str, Any]) -> List[Dict[str, Any
             if "reduced" in text or "reduce" in text or "half" in text or "25%" in text or "50%" in text or "75%" in text or "roughly" in text:
                 hours = parse_time_window(note)
                 if not hours:
-                    # approximate common solar reduction windows
-                    hours = [10, 11, 12, 13, 14]
+                    hours = infer_context_window(text, [10, 11, 12, 13, 14])
                 factor = 0.5 if "half" in text or "50%" in text else 0.25 if "25%" in text else 0.75 if "75%" in text else 0.5
                 directive = {
                     "note_index": idx,
@@ -99,7 +143,7 @@ def detect_directives_from_notes(scenario: Dict[str, Any]) -> List[Dict[str, Any
         ):
             hours = parse_time_window(note)
             if not hours:
-                hours = [2, 3, 4] if "2 am" in text or "2 am" in text else []
+                hours = infer_context_window(text, [2, 3, 4] if "night" in text or "overnight" in text else [])
             if hours:
                 directive = {
                     "note_index": idx,
@@ -115,7 +159,7 @@ def detect_directives_from_notes(scenario: Dict[str, Any]) -> List[Dict[str, Any
         ):
             hours = parse_time_window(note)
             if not hours:
-                hours = [17, 18] if "5 pm" in text or "5 pm" in text else []
+                hours = infer_context_window(text, [17, 18] if "evening" in text or "peak" in text else [])
             if hours:
                 directive = {
                     "note_index": idx,
@@ -130,7 +174,7 @@ def detect_directives_from_notes(scenario: Dict[str, Any]) -> List[Dict[str, Any
             minimum = parse_numeric_value(note, ["at least", "reserve", "minimum", "remain"])
             hours = parse_time_window(note)
             if minimum is not None and not hours:
-                hours = list(range(18, 22))
+                hours = infer_context_window(text, list(range(18, 22)))
             if minimum is not None and hours:
                 directive = {
                     "note_index": idx,
@@ -145,7 +189,7 @@ def detect_directives_from_notes(scenario: Dict[str, Any]) -> List[Dict[str, Any
             max_grid = parse_numeric_value(note, ["grid", "transformer", "limit", "cap", "below", "at most"])
             hours = parse_time_window(note)
             if max_grid is not None and not hours:
-                hours = list(range(19, 22))
+                hours = infer_context_window(text, list(range(19, 22)))
             if max_grid is not None and hours:
                 directive = {
                     "note_index": idx,
@@ -215,13 +259,14 @@ def solve_scenario(scenario: Dict[str, Any]) -> Dict[str, Any]:
     battery = scenario["battery"]
     directives = detect_directives_from_notes(scenario)
     lookup = build_directive_lookup(directives)
+    step = infer_step(scenario)
 
     cap = float(battery["capacity_kwh"])
     initial = float(battery["initial_energy_kwh"])
     base_min = float(battery["minimum_energy_kwh"])
     charge_limit = float(battery["max_charge_kwh_per_hour"])
     discharge_limit = float(battery["max_discharge_kwh_per_hour"])
-    initial_idx = int(round(initial / STEP))
+    initial_idx = int(round(initial / step))
 
     prev_states: Dict[int, float] = {initial_idx: 0.0}
     back: Dict[int, Dict[int, Tuple[int, str, float, float, float]]] = {}
@@ -238,23 +283,17 @@ def solve_scenario(scenario: Dict[str, Any]) -> Dict[str, Any]:
         next_states: Dict[int, float] = {}
         back[hour] = {}
 
-        charge_step_count = int(round(charge_limit / STEP))
-        discharge_step_count = int(round(discharge_limit / STEP))
+        charge_step_count = int(round(charge_limit / step))
+        discharge_step_count = int(round(discharge_limit / step))
 
         for state_idx, cost_so_far in prev_states.items():
-            current_energy = state_idx * STEP
+            current_energy = state_idx * step
 
-            if charge_step_count > 0:
-                charge_amounts = [0.0]
-                charge_amounts.extend([x * STEP for x in range(1, charge_step_count + 1)])
-            else:
-                charge_amounts = [0.0]
+            charge_amounts = [0.0]
+            charge_amounts.extend([x * step for x in range(1, charge_step_count + 1)])
 
-            if discharge_step_count > 0:
-                discharge_amounts = [0.0]
-                discharge_amounts.extend([x * STEP for x in range(1, discharge_step_count + 1)])
-            else:
-                discharge_amounts = [0.0]
+            discharge_amounts = [0.0]
+            discharge_amounts.extend([x * step for x in range(1, discharge_step_count + 1)])
 
             for charge_amt in charge_amounts:
                 if no_charge and charge_amt > EPS:
@@ -269,6 +308,8 @@ def solve_scenario(scenario: Dict[str, Any]) -> Dict[str, Any]:
                         continue
                     if charge_amt > EPS and discharge_amt > EPS:
                         continue
+                    if discharge_amt > demand + charge_amt + EPS:
+                        continue
 
                     new_energy = current_energy + charge_amt - discharge_amt
                     if new_energy < -EPS or new_energy > cap + EPS:
@@ -278,24 +319,31 @@ def solve_scenario(scenario: Dict[str, Any]) -> Dict[str, Any]:
                     if new_energy < min_allowed - EPS:
                         continue
 
-                    solar_used = min(effective_solar, demand + charge_amt - discharge_amt)
+                    net_need = demand + charge_amt - discharge_amt
+                    if net_need < -EPS:
+                        continue
+
+                    solar_used = min(effective_solar, net_need)
                     if solar_used < -EPS:
                         solar_used = 0.0
 
-                    grid_import = max(0.0, demand + charge_amt - discharge_amt - effective_solar)
+                    grid_import = max(0.0, net_need - effective_solar)
                     if max_grid_cap is not None and grid_import > max_grid_cap + EPS:
                         continue
 
-                    if abs(grid_import) < EPS:
-                        grid_import = 0.0
-
                     tariff = float(hour_data["tariff_bdt_per_kwh"])
                     total_cost = cost_so_far + grid_import * tariff
-                    new_idx = int(round(new_energy / STEP))
+                    new_idx = int(round(new_energy / step))
 
                     if new_idx not in next_states or total_cost < next_states[new_idx] - EPS:
                         next_states[new_idx] = total_cost
-                        back[hour][new_idx] = (state_idx, "charge" if charge_amt > EPS else "discharge" if discharge_amt > EPS else "idle", charge_amt if charge_amt > EPS else discharge_amt if discharge_amt > EPS else 0.0, grid_import, solar_used)
+                        back[hour][new_idx] = (
+                            state_idx,
+                            "charge" if charge_amt > EPS else "discharge" if discharge_amt > EPS else "idle",
+                            charge_amt if charge_amt > EPS else discharge_amt if discharge_amt > EPS else 0.0,
+                            grid_import,
+                            solar_used,
+                        )
 
         prev_states = next_states
         if not prev_states:
@@ -303,17 +351,15 @@ def solve_scenario(scenario: Dict[str, Any]) -> Dict[str, Any]:
 
     final_energy = initial_idx
     if final_energy not in prev_states:
-        # try to recover the best nearby feasible state if exact end state is impossible due to floating point drift
-        nearest_state = min(prev_states.keys(), key=lambda idx: abs(idx * STEP - initial))
+        nearest_state = min(prev_states.keys(), key=lambda idx: abs(idx * step - initial))
         final_energy = nearest_state
 
-    if abs(final_energy * STEP - initial) > 1e-4:
-        raise ValueError(f"Final battery state mismatch: expected {initial}, got {final_energy * STEP}")
+    if abs(final_energy * step - initial) > 1e-4:
+        raise ValueError(f"Final battery state mismatch: expected {initial}, got {final_energy * step}")
 
     plan: List[Dict[str, Any]] = []
     state_idx = final_energy
-    for hour_data in reversed(hours): 
-        
+    for hour_data in reversed(hours):
         hour = int(hour_data["hour"])
         prev_idx, action, battery_kwh, grid_import, solar_used = back[hour][state_idx]
         plan.append({
@@ -322,7 +368,7 @@ def solve_scenario(scenario: Dict[str, Any]) -> Dict[str, Any]:
             "solar_used_kwh": round(solar_used, 6),
             "battery_action": action,
             "battery_kwh": round(battery_kwh, 6),
-            "battery_energy_after_kwh": round(state_idx * STEP, 6),
+            "battery_energy_after_kwh": round(state_idx * step, 6),
         })
         state_idx = prev_idx
 
