@@ -18,13 +18,13 @@ try:
         ScenarioRequest,
     )
 except ImportError:
-    from app.schemas import (
-        ACTIVE_DIRECTIVE_TYPES,
-        BatteryProfile,
-        DirectiveInterpretation,
-        DirectiveType,
-        ScenarioRequest,
-    )
+    from schemas import (
+    ACTIVE_DIRECTIVE_TYPES,
+    BatteryProfile,
+    DirectiveInterpretation,
+    DirectiveType,
+    ScenarioRequest,
+)
 
 
 WORD_NUMBERS: dict[str, int] = {
