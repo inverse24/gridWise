@@ -433,6 +433,7 @@ def validate_hour_structure(hourly_plan: Any) -> None:
 def validate_directive_interpretation(
     directives: Any,
     expected_note_count: Optional[int] = None,
+    scenario: Optional[Mapping[str, Any]] = None,
 ) -> None:
     if not isinstance(directives, list):
         raise PlanValidationError("directive_interpretation must be an array")
@@ -542,7 +543,7 @@ def validate_directive_interpretation(
                     structured["minimum_energy_kwh"],
                     "minimum_battery_reserve",
                 )
-                if reserve > _capacity(scenario) + TOLERANCE:
+                if scenario is not None and reserve > _capacity(scenario) + TOLERANCE:
                     raise PlanValidationError(
                         "minimum_battery_reserve cannot exceed battery capacity"
                     )
@@ -863,6 +864,7 @@ def validate_and_build_response(
     validate_directive_interpretation(
         directives,
         expected_note_count=_expected_note_count(scenario),
+        scenario=scenario,
     )
 
     validate_hourly_plan(
