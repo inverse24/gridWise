@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Any
 
+import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-import gridwise_section_02_optimizer as optimizer
-import gridwise_section_03_validator as validator
-from schemas import ScenarioRequest
+from gridwise_section_02_optimizer import InfeasibleScenario, build_plan, plan_totals
+from gridwise_section_03_validator import PlanValidationError, validate_and_build_response
+from schemas import ErrorResponse, HealthResponse, ScenarioRequest
 from section1 import interpret_scenario
 
 logging.basicConfig(
@@ -19,35 +21,48 @@ logging.basicConfig(
 logger = logging.getLogger("gridwise")
 
 app = FastAPI(
-    title="GridWise",
-    description="LLM-assisted smart campus energy optimization",
+    title="GridWise API",
     version="1.0.0",
+    description="LLM-assisted energy-optimization service for the GridWise challenge.",
 )
 
 
 def _error(status: int, code: str, detail: str) -> JSONResponse:
-    return JSONResponse(status_code=status, content={"error": code, "detail": detail})
+    return JSONResponse(
+        status_code=status,
+        content=ErrorResponse(error=code, detail=detail).model_dump(),
+    )
 
 
 @app.exception_handler(RequestValidationError)
-async def on_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+async def validation_error_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
     fields = sorted({".".join(str(p) for p in e.get("loc", ())[1:]) for e in exc.errors()})
     named = ", ".join(f for f in fields if f)
-    return _error(400, "invalid_request", f"Invalid or missing fields: {named}" if named else "Request body did not match the required schema.")
+    detail = (
+        f"Invalid or missing fields: {named}"
+        if named
+        else "Request body did not match the required schema."
+    )
+    return _error(400, "invalid_request", detail)
 
 
 @app.exception_handler(Exception)
-async def on_unhandled_error(_: Request, exc: Exception) -> JSONResponse:
+async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:
     logger.exception("unhandled error: %s", type(exc).__name__)
     return _error(500, "internal_error", "The service could not complete this request.")
 
 
-@app.get("/health")
-async def health() -> JSONResponse:
-    return JSONResponse(status_code=200, content={"status": "ok"})
+@app.get("/health", response_model=HealthResponse)
+def health() -> dict[str, str]:
+    return {"status": "ok"}
 
 
-def _plan_summary(scenario: ScenarioRequest, interpretation, totals) -> str:
+@app.get("/", response_model=HealthResponse)
+def root() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+def _plan_summary(interpretation, totals) -> str:
     applied = [e for e in interpretation.entries if e.applies]
     ignored = len(interpretation.entries) - len(applied)
     total_grid, total_cost, peak_grid = totals
@@ -55,7 +70,7 @@ def _plan_summary(scenario: ScenarioRequest, interpretation, totals) -> str:
     if applied:
         parts = []
         for entry in applied:
-            hours = entry.structured_adjustment.get("hours", [])
+            hours = (entry.structured_adjustment or {}).get("hours", [])
             span = f"hours {hours[0]}-{hours[-1]}" if hours else "the stated window"
             parts.append(f"{entry.directive_type.value} over {span}")
         directive_text = "Applied " + "; ".join(parts) + "."
@@ -73,41 +88,45 @@ def _plan_summary(scenario: ScenarioRequest, interpretation, totals) -> str:
 
 
 @app.post("/optimize-energy")
-async def optimize_energy(scenario: ScenarioRequest) -> JSONResponse:
-    scenario_dict = scenario.model_dump(mode="json")
-
-    interpretation = interpret_scenario(scenario)
+def optimize_energy(request: ScenarioRequest) -> JSONResponse:
+    interpretation = interpret_scenario(request)
     if interpretation.warnings:
         logger.info(
             "scenario=%s source=%s warnings=%s",
-            scenario.scenario_id,
+            request.scenario_id,
             interpretation.source,
             interpretation.warnings,
         )
 
     try:
-        plan = optimizer.build_plan(scenario, interpretation)
-    except optimizer.InfeasibleScenario as exc:
-        logger.warning("scenario=%s infeasible: %s", scenario.scenario_id, exc)
+        plan = build_plan(request, interpretation)
+    except InfeasibleScenario as exc:
+        logger.warning("scenario=%s infeasible: %s", request.scenario_id, exc)
         return _error(422, "infeasible_scenario", str(exc))
 
-    totals = optimizer.plan_totals(plan, scenario)
-    total_grid, total_cost, peak_grid = totals
+    totals = plan_totals(plan, request)
+    total_grid_kwh, total_cost_bdt, peak_grid_kwh = totals
 
-    optimizer_result = {
-        "scenario_id": scenario.scenario_id,
-        "directive_interpretation": [e.model_dump(mode="json") for e in interpretation.entries],
-        "hourly_plan": [p.model_dump(mode="json") for p in plan],
-        "total_grid_kwh": total_grid,
-        "total_cost_bdt": total_cost,
-        "peak_grid_kwh": peak_grid,
-        "plan_summary": _plan_summary(scenario, interpretation, totals),
+    payload: dict[str, Any] = {
+        "scenario_id": request.scenario_id,
+        "directive_interpretation": [
+            entry.model_dump(mode="json") for entry in interpretation.entries
+        ],
+        "hourly_plan": [hour.model_dump(mode="json") for hour in plan],
+        "total_grid_kwh": total_grid_kwh,
+        "total_cost_bdt": total_cost_bdt,
+        "peak_grid_kwh": peak_grid_kwh,
+        "plan_summary": _plan_summary(interpretation, totals),
     }
 
     try:
-        response = validator.validate_and_build_response(optimizer_result, scenario_dict)
-    except validator.PlanValidationError as exc:
-        logger.error("scenario=%s failed self-validation: %s", scenario.scenario_id, exc)
+        final_response = validate_and_build_response(payload, request.model_dump(mode="json"))
+    except PlanValidationError as exc:
+        logger.error("scenario=%s failed self-validation: %s", request.scenario_id, exc)
         return _error(500, "internal_error", "The service could not produce a valid schedule.")
 
-    return JSONResponse(status_code=200, content=response)
+    return JSONResponse(status_code=200, content=final_response)
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
