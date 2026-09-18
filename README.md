@@ -14,10 +14,25 @@ directives, validates them deterministically, and returns a cost-minimal
 
 | Item | Value |
 |---|---|
-| Live endpoint | `TODO: https://<your-service>` |
+| Live endpoint | `https://gridwise-1.onrender.com` |
 | Docker image | `ghcr.io/inverse24/gridwise:latest` |
 | Image digest | `TODO: sha256:...` (from the GitHub Actions run log) |
 | Repository | `https://github.com/inverse24/gridWise` |
+
+> **Please wake the service before testing.** It is hosted on a free tier that
+> suspends the instance after a period of inactivity. The first request after an
+> idle period can take up to 50 seconds while the instance starts; every request
+> after that responds in about a second. Send a `GET /health` first and wait for
+> it to return before timing anything else.
+
+```bash
+curl https://gridwise-1.onrender.com/health
+# {"status":"ok"}   <- may take up to 50s on the very first call
+
+curl -X POST https://gridwise-1.onrender.com/optimize-energy \
+  -H 'content-type: application/json' \
+  -d @sample01.json
+```
 
 ---
 
@@ -258,6 +273,10 @@ gridWise/
 
 ## Known limitations
 
+- The service is hosted on a free tier that suspends idle instances. A cold
+  start costs up to 50 seconds on the first request; subsequent requests respond
+  in about a second. A scheduled health ping keeps the instance warm during the
+  evaluation window.
 - Interpretation quality depends on Gemini availability. With no reachable
   provider the service still responds, but from the conservative fallback
   reading, which is weaker on unusual paraphrases.
