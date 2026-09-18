@@ -1,449 +1,168 @@
 from __future__ import annotations
 
-import json
-import re
 from decimal import Decimal
-from pathlib import Path
-from typing import Dict, List, Tuple, Any
 
-STEP = 0.5
+import numpy as np
+
+from schemas import BatteryAction, HourPlan, ScenarioRequest
+from section1 import InterpretationResult
+
 EPS = 1e-9
+MAX_STATES = 20000
 
 
-def decimal_places(value: float) -> int:
-    decimal_value = Decimal(str(value))
-    exponent = decimal_value.as_tuple().exponent
-    if exponent >= 0:
-        return 0
-    return abs(exponent)
+class InfeasibleScenario(RuntimeError):
+    pass
 
 
-def infer_step(scenario: Dict[str, Any]) -> float:
-    values: List[float] = []
-    battery = scenario["battery"]
-    values.extend([
-        float(battery["initial_energy_kwh"]),
-        float(battery["minimum_energy_kwh"]),
-        float(battery["capacity_kwh"]),
-        float(battery["max_charge_kwh_per_hour"]),
-        float(battery["max_discharge_kwh_per_hour"]),
-    ])
-    for hour in scenario["hours"]:
-        values.extend([
-            float(hour["demand_kwh"]),
-            float(hour["solar_kwh"]),
-        ])
-
-    max_decimals = max((decimal_places(float(v)) for v in values), default=0)
-    if max_decimals == 0:
-        return 1.0
-
-    step = 10 ** (-max_decimals)
-    return min(step, 0.1)
+def _decimals(value: float) -> int:
+    exponent = Decimal(str(float(value))).as_tuple().exponent
+    return abs(exponent) if isinstance(exponent, int) and exponent < 0 else 0
 
 
-def to_hour_index(value: str) -> int:
-    text = value.strip().lower()
-    if text == "noon":
-        return 12
-    if text == "midnight":
-        return 0
-    if text.endswith("am"):
-        hour = int(text[:-2])
-    elif text.endswith("pm"):
-        hour = int(text[:-2])
-        if hour != 12:
-            hour += 12
-    else:
-        hour = int(text)
-    return hour
-
-
-def normalize_note_text(note: str) -> str:
-    return note.lower().replace("–", "-").replace("—", "-")
-
-
-def infer_context_window(text: str, default: List[int] | None = None) -> List[int]:
-    if "afternoon" in text or "midday" in text or "daytime" in text:
-        return list(range(12, 18))
-    if "evening" in text or "peak" in text or "sunset" in text:
-        return list(range(17, 22))
-    if "night" in text or "overnight" in text or "midnight" in text:
-        return list(range(0, 6))
-    if "morning" in text or "early morning" in text:
-        return list(range(6, 12))
-    return default or []
-
-
-def parse_time_window(note: str) -> List[int]:
-    text = normalize_note_text(note)
-    patterns = [
-        r"from\s+([^\n]+?)\s+until\s+([^\n]+?)(?:\.|$)",
-        r"from\s+([^\n]+?)\s+to\s+([^\n]+?)(?:\.|$)",
+def infer_step(scenario: ScenarioRequest, floors: list[float]) -> float:
+    b = scenario.battery
+    values = [
+        b.capacity_kwh,
+        b.initial_energy_kwh,
+        b.minimum_energy_kwh,
+        b.max_charge_kwh_per_hour,
+        b.max_discharge_kwh_per_hour,
+        *floors,
+        *scenario.demand(),
+        *scenario.solar(),
     ]
-    for pattern in patterns:
-        m = re.search(pattern, text)
-        if m:
-            start_text = m.group(1).strip()
-            end_text = m.group(2).strip()
-            try:
-                start = to_hour_index(start_text)
-                end = to_hour_index(end_text)
-                if end <= start:
-                    end = start + 1
-                hours = list(range(start, end))
-                return hours
-            except ValueError:
-                pass
-
-    # fallback: infer from coarse phrases
-    for indicator in ["noon", "pm", "am"]:
-        if indicator in text:
-            pass
-
-    return []
+    places = max((_decimals(v) for v in values), default=0)
+    return 1.0 / (10 ** min(places, 3))
 
 
-def parse_numeric_value(note: str, keywords: List[str]) -> float | None:
-    text = normalize_note_text(note)
-    for kw in keywords:
-        if kw in text:
-            match = re.search(rf"(\d+(?:\.\d+)?)\s*(?:kwh|kwh\b)", text)
-            if match:
-                return float(match.group(1))
-    return None
+def build_plan(
+    scenario: ScenarioRequest,
+    interpretation: InterpretationResult,
+) -> list[HourPlan]:
+    b = scenario.battery
+    demand = scenario.demand()
+    tariff = scenario.tariff()
+    eff_solar = interpretation.effective_solar(scenario.solar())
 
+    floors = interpretation.reserve_floor(b.minimum_energy_kwh)
+    caps = interpretation.grid_cap()
+    no_charge = interpretation.no_charge_hours()
+    no_discharge = interpretation.no_discharge_hours()
 
-def detect_directives_from_notes(scenario: Dict[str, Any]) -> List[Dict[str, Any]]:
-    notes = scenario.get("operator_notes", [])
-    directives: List[Dict[str, Any]] = []
+    step = infer_step(scenario, floors)
+    if b.capacity_kwh / step > MAX_STATES:
+        step = b.capacity_kwh / MAX_STATES
 
-    for idx, note in enumerate(notes):
-        text = normalize_note_text(note)
-        relevant = False
-        directive: Dict[str, Any] = {"note_index": idx, "applies": False, "directive_type": "no_op", "structured_adjustment": None}
+    initial_idx = int(round(b.initial_energy_kwh / step))
+    cap_idx = int(round(b.capacity_kwh / step))
+    charge_steps = int(round(b.max_charge_kwh_per_hour / step))
+    discharge_steps = int(round(b.max_discharge_kwh_per_hour / step))
+    n_states = cap_idx + 1
 
-        if "solar" in text or "panel" in text or "cloud cover" in text or "forecast solar" in text:
-            if "reduced" in text or "reduce" in text or "half" in text or "25%" in text or "50%" in text or "75%" in text or "roughly" in text:
-                hours = parse_time_window(note)
-                if not hours:
-                    hours = infer_context_window(text, [10, 11, 12, 13, 14])
-                factor = 0.5 if "half" in text or "50%" in text else 0.25 if "25%" in text else 0.75 if "75%" in text else 0.5
-                directive = {
-                    "note_index": idx,
-                    "applies": True,
-                    "directive_type": "solar_reduction",
-                    "structured_adjustment": {"hours": sorted(set(hours)), "factor": factor},
-                    "explanation": "Usable solar is reduced in the stated window."
-                }
-                relevant = True
+    cur = np.full(n_states, np.inf)
+    cur[initial_idx] = 0.0
 
-        if not relevant and ("charging" in text or "charge" in text or "charger" in text or "isolated" in text) and (
-            "disabled" in text or "unavailable" in text or "stop" in text or "not available" in text or "isolated" in text
-        ):
-            hours = parse_time_window(note)
-            if not hours:
-                hours = infer_context_window(text, [2, 3, 4] if "night" in text or "overnight" in text else [])
-            if hours:
-                directive = {
-                    "note_index": idx,
-                    "applies": True,
-                    "directive_type": "no_charge_window",
-                    "structured_adjustment": {"hours": sorted(set(hours))},
-                    "explanation": "Battery charging is unavailable in the stated window."
-                }
-                relevant = True
+    moves: list[list[tuple[int, str, float, float, float]]] = []
+    chosen_all: list[np.ndarray] = []
 
-        if not relevant and ("do not discharge" in text or "discharge" in text or "relay testing" in text) and (
-            "disabled" in text or "not allowed" in text or "do not" in text or "blocked" in text or "relay" in text
-        ):
-            hours = parse_time_window(note)
-            if not hours:
-                hours = infer_context_window(text, [17, 18] if "evening" in text or "peak" in text else [])
-            if hours:
-                directive = {
-                    "note_index": idx,
-                    "applies": True,
-                    "directive_type": "no_discharge_window",
-                    "structured_adjustment": {"hours": sorted(set(hours))},
-                    "explanation": "Battery discharge is unavailable in the stated window."
-                }
-                relevant = True
+    for h in range(24):
+        floor_idx = int(round(floors[h] / step))
+        cap_h = caps[h]
+        solar_h = eff_solar[h]
+        demand_h = demand[h]
+        tariff_h = tariff[h]
 
-        if not relevant and ("keep at least" in text or "at least" in text or "reserve" in text or "minimum" in text or "remain in the battery" in text):
-            minimum = parse_numeric_value(note, ["at least", "reserve", "minimum", "remain"])
-            hours = parse_time_window(note)
-            if minimum is not None and not hours:
-                hours = infer_context_window(text, list(range(18, 22)))
-            if minimum is not None and hours:
-                directive = {
-                    "note_index": idx,
-                    "applies": True,
-                    "directive_type": "minimum_battery_reserve",
-                    "structured_adjustment": {"hours": sorted(set(hours)), "minimum_energy_kwh": minimum},
-                    "explanation": "A battery reserve is required in the stated window."
-                }
-                relevant = True
+        # A transition's cost depends only on the hour and the energy delta,
+        # never on the state it starts from, so each is evaluated once.
+        transitions: list[tuple[int, str, float, float, float]] = []
+        lo = 0 if h in no_discharge else -discharge_steps
+        hi = 0 if h in no_charge else charge_steps
 
-        if not relevant and ("grid" in text or "transformer" in text or "limit" in text or "cap" in text or "stay at or below" in text or "at most" in text):
-            max_grid = parse_numeric_value(note, ["grid", "transformer", "limit", "cap", "below", "at most"])
-            hours = parse_time_window(note)
-            if max_grid is not None and not hours:
-                hours = infer_context_window(text, list(range(19, 22)))
-            if max_grid is not None and hours:
-                directive = {
-                    "note_index": idx,
-                    "applies": True,
-                    "directive_type": "max_grid_window",
-                    "structured_adjustment": {"hours": sorted(set(hours)), "max_grid_kwh": max_grid},
-                    "explanation": "Grid import is capped in the stated window."
-                }
-                relevant = True
+        for d in range(lo, hi + 1):
+            charge = d * step if d > 0 else 0.0
+            discharge = -d * step if d < 0 else 0.0
 
-        if not relevant:
-            directive = {
-                "note_index": idx,
-                "applies": False,
-                "directive_type": "no_op",
-                "structured_adjustment": None,
-                "explanation": "This note does not affect today's schedule."
-            }
+            net_need = demand_h + charge - discharge
+            if net_need < -EPS:
+                continue
 
-        directives.append(directive)
+            solar_used = solar_h if solar_h < net_need else net_need
+            grid = net_need - solar_used
+            if grid < 0.0:
+                grid = 0.0
+            if cap_h is not None and grid > cap_h + EPS:
+                continue
 
-    return directives
+            action = "charge" if d > 0 else "discharge" if d < 0 else "idle"
+            magnitude = charge if d > 0 else discharge if d < 0 else 0.0
+            transitions.append((d, action, magnitude, grid, solar_used))
 
+        if not transitions:
+            raise InfeasibleScenario(
+                f"hour {h}: no battery action satisfies the applied directives"
+            )
 
-def build_directive_lookup(directives: List[Dict[str, Any]]) -> Dict[str, Any]:
-    lookup: Dict[str, Any] = {
-        "solar_reduction": [],
-        "minimum_battery_reserve": [],
-        "no_charge_window": [],
-        "no_discharge_window": [],
-        "max_grid_window": [],
-    }
-    for directive in directives:
-        if not directive["applies"]:
-            continue
-        typ = directive["directive_type"]
-        if typ in lookup:
-            lookup[typ].append(directive["structured_adjustment"])
-    return lookup
+        nxt = np.full(n_states, np.inf)
+        chosen = np.full(n_states, -1, dtype=np.int32)
 
+        for t_index, (d, _, _, grid, _) in enumerate(transitions):
+            edge_cost = grid * tariff_h
+            if d >= 0:
+                src = cur[: n_states - d] if d else cur
+                dst_lo, dst_hi = d, n_states
+            else:
+                src = cur[-d:]
+                dst_lo, dst_hi = 0, n_states + d
 
-def effective_solar_for_hour(hour_record: Dict[str, Any], directive_lookup: Dict[str, Any]) -> float:
-    solar = float(hour_record["solar_kwh"])
-    for rule in directive_lookup.get("solar_reduction", []):
-        if hour_record["hour"] in set(rule["hours"]):
-            solar *= float(rule["factor"])
-    return solar
+            candidate = src + edge_cost
+            window = nxt[dst_lo:dst_hi]
+            better = candidate < window - EPS
+            window[better] = candidate[better]
+            chosen[dst_lo:dst_hi][better] = t_index
 
+        if floor_idx > 0:
+            nxt[:floor_idx] = np.inf
+            chosen[:floor_idx] = -1
 
-def hourly_minimum_reserve(hour: int, directive_lookup: Dict[str, Any], battery_min: float) -> float:
-    min_required = battery_min
-    for rule in directive_lookup.get("minimum_battery_reserve", []):
-        if hour in set(rule["hours"]):
-            min_required = max(min_required, float(rule["minimum_energy_kwh"]))
-    return min_required
+        if not np.isfinite(nxt).any():
+            raise InfeasibleScenario(
+                f"no feasible battery state at hour {h} under the applied directives"
+            )
 
+        cur = nxt
+        moves.append(transitions)
+        chosen_all.append(chosen)
 
-def hourly_max_grid(hour: int, directive_lookup: Dict[str, Any]) -> float | None:
-    for rule in directive_lookup.get("max_grid_window", []):
-        if hour in set(rule["hours"]):
-            return float(rule["max_grid_kwh"])
-    return None
+    if not np.isfinite(cur[initial_idx]):
+        raise InfeasibleScenario(
+            "no schedule returns the battery to its initial energy by hour 23"
+        )
 
-
-def solve_scenario(scenario: Dict[str, Any]) -> Dict[str, Any]:
-    hours = sorted(scenario["hours"], key=lambda h: h["hour"])
-    battery = scenario["battery"]
-    directives = detect_directives_from_notes(scenario)
-    lookup = build_directive_lookup(directives)
-    step = infer_step(scenario)
-
-    cap = float(battery["capacity_kwh"])
-    initial = float(battery["initial_energy_kwh"])
-    base_min = float(battery["minimum_energy_kwh"])
-    charge_limit = float(battery["max_charge_kwh_per_hour"])
-    discharge_limit = float(battery["max_discharge_kwh_per_hour"])
-    initial_idx = int(round(initial / step))
-
-    prev_states: Dict[int, float] = {initial_idx: 0.0}
-    back: Dict[int, Dict[int, Tuple[int, str, float, float, float]]] = {}
-
-    for hour_data in hours:
-        hour = int(hour_data["hour"])
-        demand = float(hour_data["demand_kwh"])
-        effective_solar = effective_solar_for_hour(hour_data, lookup)
-        reserve = hourly_minimum_reserve(hour, lookup, base_min)
-        max_grid_cap = hourly_max_grid(hour, lookup)
-        no_charge = hour in {h for rule in lookup.get("no_charge_window", []) for h in rule["hours"]}
-        no_discharge = hour in {h for rule in lookup.get("no_discharge_window", []) for h in rule["hours"]}
-
-        next_states: Dict[int, float] = {}
-        back[hour] = {}
-
-        charge_step_count = int(round(charge_limit / step))
-        discharge_step_count = int(round(discharge_limit / step))
-
-        for state_idx, cost_so_far in prev_states.items():
-            current_energy = state_idx * step
-
-            charge_amounts = [0.0]
-            charge_amounts.extend([x * step for x in range(1, charge_step_count + 1)])
-
-            discharge_amounts = [0.0]
-            discharge_amounts.extend([x * step for x in range(1, discharge_step_count + 1)])
-
-            for charge_amt in charge_amounts:
-                if no_charge and charge_amt > EPS:
-                    continue
-                if charge_amt > charge_limit + EPS:
-                    continue
-
-                for discharge_amt in discharge_amounts:
-                    if no_discharge and discharge_amt > EPS:
-                        continue
-                    if discharge_amt > discharge_limit + EPS:
-                        continue
-                    if charge_amt > EPS and discharge_amt > EPS:
-                        continue
-                    if discharge_amt > demand + charge_amt + EPS:
-                        continue
-
-                    new_energy = current_energy + charge_amt - discharge_amt
-                    if new_energy < -EPS or new_energy > cap + EPS:
-                        continue
-
-                    min_allowed = max(base_min, reserve)
-                    if new_energy < min_allowed - EPS:
-                        continue
-
-                    net_need = demand + charge_amt - discharge_amt
-                    if net_need < -EPS:
-                        continue
-
-                    solar_used = min(effective_solar, net_need)
-                    if solar_used < -EPS:
-                        solar_used = 0.0
-
-                    grid_import = max(0.0, net_need - effective_solar)
-                    if max_grid_cap is not None and grid_import > max_grid_cap + EPS:
-                        continue
-
-                    tariff = float(hour_data["tariff_bdt_per_kwh"])
-                    total_cost = cost_so_far + grid_import * tariff
-                    new_idx = int(round(new_energy / step))
-
-                    if new_idx not in next_states or total_cost < next_states[new_idx] - EPS:
-                        next_states[new_idx] = total_cost
-                        back[hour][new_idx] = (
-                            state_idx,
-                            "charge" if charge_amt > EPS else "discharge" if discharge_amt > EPS else "idle",
-                            charge_amt if charge_amt > EPS else discharge_amt if discharge_amt > EPS else 0.0,
-                            grid_import,
-                            solar_used,
-                        )
-
-        prev_states = next_states
-        if not prev_states:
-            raise ValueError(f"No feasible schedule for hour {hour}")
-
-    final_energy = initial_idx
-    if final_energy not in prev_states:
-        nearest_state = min(prev_states.keys(), key=lambda idx: abs(idx * step - initial))
-        final_energy = nearest_state
-
-    if abs(final_energy * step - initial) > 1e-4:
-        raise ValueError(f"Final battery state mismatch: expected {initial}, got {final_energy * step}")
-
-    plan: List[Dict[str, Any]] = []
-    state_idx = final_energy
-    for hour_data in reversed(hours):
-        hour = int(hour_data["hour"])
-        prev_idx, action, battery_kwh, grid_import, solar_used = back[hour][state_idx]
-        plan.append({
-            "hour": hour,
-            "grid_kwh": round(grid_import, 6),
-            "solar_used_kwh": round(solar_used, 6),
-            "battery_action": action,
-            "battery_kwh": round(battery_kwh, 6),
-            "battery_energy_after_kwh": round(state_idx * step, 6),
-        })
-        state_idx = prev_idx
+    plan: list[HourPlan] = []
+    idx = initial_idx
+    for h in range(23, -1, -1):
+        t_index = int(chosen_all[h][idx])
+        d, action, magnitude, grid, solar_used = moves[h][t_index]
+        plan.append(
+            HourPlan(
+                hour=h,
+                grid_kwh=round(grid, 6),
+                solar_used_kwh=round(solar_used, 6),
+                battery_action=BatteryAction(action),
+                battery_kwh=round(magnitude, 6),
+                battery_energy_after_kwh=round(idx * step, 6),
+            )
+        )
+        idx -= d
 
     plan.reverse()
-
-    total_grid = sum(float(entry["grid_kwh"]) for entry in plan)
-    total_cost = sum(float(entry["grid_kwh"]) * next(h["tariff_bdt_per_kwh"] for h in hours if h["hour"] == entry["hour"]) for entry in plan)
-    peak_grid = max(float(entry["grid_kwh"]) for entry in plan)
-
-    final_output = {
-        "scenario_id": scenario["scenario_id"],
-        "directive_interpretation": detect_directives_from_notes(scenario),
-        "hourly_plan": plan,
-        "total_grid_kwh": round(total_grid, 2),
-        "total_cost_bdt": round(total_cost, 2),
-        "peak_grid_kwh": round(peak_grid, 2),
-        "plan_summary": "Optimized charge and discharge timing to minimize cost while satisfying all battery and grid directives."
-    }
-    return final_output
+    return plan
 
 
-def load_sample_cases(path: str) -> List[Dict[str, Any]]:
-    with open(path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-    return payload["cases"]
-
-
-def validate_plan(plan: List[Dict[str, Any]], scenario: Dict[str, Any], directives: List[Dict[str, Any]]) -> bool:
-    hours_map = {int(item["hour"]): item for item in scenario["hours"]}
-    battery = scenario["battery"]
-    current_energy = float(battery["initial_energy_kwh"])
-    lookup = build_directive_lookup(directives)
-
-    for entry in plan:
-        hour = int(entry["hour"])
-        record = hours_map[hour]
-        if entry["battery_action"] == "charge":
-            charge = float(entry["battery_kwh"])
-            discharge = 0.0
-        elif entry["battery_action"] == "discharge":
-            charge = 0.0
-            discharge = float(entry["battery_kwh"])
-        else:
-            charge = 0.0
-            discharge = 0.0
-
-        if abs(float(entry["grid_kwh"]) + float(entry["solar_used_kwh"]) + discharge - (float(record["demand_kwh"]) + charge)) > 1e-3:
-            return False
-
-        current_energy = float(entry["battery_energy_after_kwh"])
-        if current_energy < float(battery["minimum_energy_kwh"]) - 1e-3:
-            return False
-        if current_energy > float(battery["capacity_kwh"]) + 1e-3:
-            return False
-
-        if hour in {h for rule in lookup.get("no_charge_window", []) for h in rule["hours"]} and charge > 1e-3:
-            return False
-        if hour in {h for rule in lookup.get("no_discharge_window", []) for h in rule["hours"]} and discharge > 1e-3:
-            return False
-
-    if abs(current_energy - float(battery["initial_energy_kwh"])) > 1e-3:
-        return False
-
-    return True
-
-
-if __name__ == "__main__":
-    sample_file = Path(__file__).with_name("BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json")
-    cases = load_sample_cases(str(sample_file))
-
-    for case in cases[:3]:
-        scenario = case["input"]
-        directives = detect_directives_from_notes(scenario)
-        result = solve_scenario(scenario)
-        ok = validate_plan(result["hourly_plan"], scenario, directives)
-        print(f"{scenario['scenario_id']}: valid={ok}, total_cost={result['total_cost_bdt']}, total_grid={result['total_grid_kwh']}, peak={result['peak_grid_kwh']}")
-
-
+def plan_totals(plan: list[HourPlan], scenario: ScenarioRequest) -> tuple[float, float, float]:
+    tariff = scenario.tariff()
+    total_grid = sum(p.grid_kwh for p in plan)
+    total_cost = sum(p.grid_kwh * tariff[p.hour] for p in plan)
+    peak_grid = max(p.grid_kwh for p in plan)
+    return round(total_grid, 2), round(total_cost, 2), round(peak_grid, 2)

@@ -23,9 +23,6 @@ from schemas import (
     ScenarioRequest,
 )
 
-load_dotenv()
-
-
 WORD_NUMBERS: dict[str, int] = {
     "one": 1,
     "two": 2,
