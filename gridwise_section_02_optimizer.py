@@ -445,3 +445,5 @@ if __name__ == "__main__":
         result = solve_scenario(scenario)
         ok = validate_plan(result["hourly_plan"], scenario, directives)
         print(f"{scenario['scenario_id']}: valid={ok}, total_cost={result['total_cost_bdt']}, total_grid={result['total_grid_kwh']}, peak={result['peak_grid_kwh']}")
+
+
